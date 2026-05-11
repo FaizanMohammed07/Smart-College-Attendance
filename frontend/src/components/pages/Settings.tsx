@@ -31,7 +31,7 @@ export default function Settings() {
       const res = await fetch("http://localhost:5000/api/students?limit=1");
       if (res.ok) {
         setApiStatus("connected");
-        const data = await res.json();
+        await res.json();
       } else {
         setApiStatus("error");
       }

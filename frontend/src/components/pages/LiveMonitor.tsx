@@ -6,10 +6,18 @@ import {
   AlertCircle,
   Clock,
   CheckCircle2,
+  ShieldCheck,
+  ShieldAlert,
+  Eye,
+  Move,
+  ScanFace,
 } from "lucide-react";
 import { studentsAPI, attendanceAPI } from "../../services/api";
 import socketService from "../../services/socket";
 import faceRecognitionService from "../../services/faceRecognition";
+import livenessDetectionService, {
+  type LivenessResult,
+} from "../../services/livenessDetection";
 
 interface Student {
   _id: string;
@@ -17,6 +25,7 @@ interface Student {
   rollNumber: string;
   department: string;
   faceDescriptor: number[];
+  faceDescriptors?: number[][];
 }
 
 interface DetectedStudent {
@@ -24,10 +33,12 @@ interface DetectedStudent {
   name: string;
   rollNumber: string;
   department: string;
-  lastSeen: number; // timestamp ms
-  entryTime: number; // timestamp ms
+  lastSeen: number;
+  entryTime: number;
   confidence: number;
   entryRecorded: boolean;
+  liveness: LivenessResult | null;
+  livenessConfirmed: boolean;
 }
 
 export default function LiveMonitor() {
@@ -44,6 +55,7 @@ export default function LiveMonitor() {
   const exitCheckIntervalRef = useRef<number | null>(null);
   const detectedMapRef = useRef<Map<string, DetectedStudent>>(new Map());
   const studentsRef = useRef<Student[]>([]);
+  const stopDetectionRef = useRef<(() => void) | null>(null);
 
   // Keep studentsRef in sync
   useEffect(() => {
@@ -118,8 +130,10 @@ export default function LiveMonitor() {
     }
     try {
       setError(null);
+      // Higher resolution for overhead cameras — better face detection at distance
+      // 640x480 is the sweet spot: fast for face-api.js, good enough for detection
       const mediaStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 640, height: 480, facingMode: "user" },
+        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" },
       });
       setStream(mediaStream);
       setIsActive(true);
@@ -135,10 +149,15 @@ export default function LiveMonitor() {
       setStream(null);
     }
     if (detectionIntervalRef.current) {
-      clearInterval(detectionIntervalRef.current);
+      clearTimeout(detectionIntervalRef.current);
       detectionIntervalRef.current = null;
     }
+    if (stopDetectionRef.current) {
+      stopDetectionRef.current();
+      stopDetectionRef.current = null;
+    }
     stopExitCheck();
+    livenessDetectionService.reset();
     setIsActive(false);
     if (canvasRef.current) {
       const ctx = canvasRef.current.getContext("2d");
@@ -151,8 +170,11 @@ export default function LiveMonitor() {
     if (detectionIntervalRef.current)
       clearInterval(detectionIntervalRef.current);
 
-    detectionIntervalRef.current = window.setInterval(async () => {
-      if (!videoRef.current || !canvasRef.current) return;
+    // NON-OVERLAPPING detection loop — starts next detection only after current finishes.
+    // This prevents stacking and ensures maximum throughput (~150-300ms per cycle).
+    let running = true;
+    const detectionLoop = async () => {
+      if (!running || !videoRef.current || !canvasRef.current) return;
       try {
         const results = await faceRecognitionService.detectFaces(
           videoRef.current,
@@ -160,16 +182,52 @@ export default function LiveMonitor() {
         );
         if (results.length > 0) {
           for (const result of results) {
-            await handleFaceDetected(result.studentId, result.confidence);
+            // Skip heavy liveness if already confirmed live
+            const alreadyLive = livenessDetectionService.isConfirmedLive(result.studentId);
+            let livenessResult: LivenessResult;
+
+            if (alreadyLive) {
+              // Fast path: already confirmed, return cached status
+              livenessResult = {
+                isLive: true,
+                score: 1.0,
+                checks: { blinkDetected: true, movementDetected: true, textureOk: true, depthOk: true, screenGlareOk: true, sizeOk: true },
+              };
+            } else {
+              livenessResult = livenessDetectionService.analyzeFrame(
+                result.studentId,
+                result.landmarks,
+                videoRef.current!,
+                result.box,
+              );
+            }
+
+            await handleFaceDetected(
+              result.studentId,
+              result.confidence,
+              livenessResult,
+            );
           }
         }
       } catch (err) {
         console.error("Detection error:", err);
       }
-    }, 2000);
+      // Schedule next detection immediately — no wasted wait time
+      if (running) {
+        detectionIntervalRef.current = window.setTimeout(detectionLoop, 50);
+      }
+    };
+
+    // Store a cleanup reference
+    stopDetectionRef.current = () => { running = false; };
+    detectionLoop(); // Start immediately
   }
 
-  async function handleFaceDetected(studentId: string, confidence: number) {
+  async function handleFaceDetected(
+    studentId: string,
+    confidence: number,
+    liveness: LivenessResult,
+  ) {
     const student = studentsRef.current.find((s) => s._id === studentId);
     if (!student) return;
 
@@ -178,7 +236,7 @@ export default function LiveMonitor() {
     const existing = map.get(studentId);
 
     if (!existing) {
-      // New face — record entry via API
+      // New face detected — add to map but DON'T record attendance yet
       const entry: DetectedStudent = {
         studentId: student._id,
         name: student.name,
@@ -188,20 +246,47 @@ export default function LiveMonitor() {
         entryTime: now,
         confidence,
         entryRecorded: false,
+        liveness,
+        livenessConfirmed: liveness.isLive,
       };
       map.set(studentId, entry);
 
-      try {
-        await attendanceAPI.recordEntry(studentId);
-        entry.entryRecorded = true;
-        socketService.emit("face:detected", { studentId, confidence });
-      } catch (err) {
-        console.error("Error recording entry:", err);
+      // Only record entry if liveness is ALREADY confirmed (unlikely on first frame)
+      if (liveness.isLive) {
+        try {
+          await attendanceAPI.recordEntry(studentId, liveness.score);
+          entry.entryRecorded = true;
+          socketService.emit("face:detected", {
+            studentId,
+            confidence,
+            livenessScore: liveness.score,
+          });
+        } catch (err) {
+          console.error("Error recording entry:", err);
+        }
       }
     } else {
-      // Already seen — update last-seen timestamp
+      // Already seen — update liveness and check if we can now record
       existing.lastSeen = now;
       existing.confidence = confidence;
+      existing.liveness = liveness;
+      existing.livenessConfirmed = liveness.isLive;
+
+      // Record entry once liveness is confirmed
+      if (liveness.isLive && !existing.entryRecorded) {
+        try {
+          await attendanceAPI.recordEntry(studentId, liveness.score);
+          existing.entryRecorded = true;
+          existing.entryTime = now; // Entry time = when liveness confirmed
+          socketService.emit("face:detected", {
+            studentId,
+            confidence,
+            livenessScore: liveness.score,
+          });
+        } catch (err) {
+          console.error("Error recording entry:", err);
+        }
+      }
     }
 
     syncListFromMap();
@@ -259,7 +344,7 @@ export default function LiveMonitor() {
           Live Monitor
         </h1>
         <p className="text-gray-500 mt-1 text-sm">
-          Real-time face recognition & attendance tracking
+          Real-time multi-angle face recognition & attendance tracking
         </p>
       </div>
 
@@ -346,10 +431,18 @@ export default function LiveMonitor() {
                 </span>
               </div>
               {isActive && (
-                <div className="flex items-center gap-2">
-                  <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
-                  <span className="text-gray-500">Scanning...</span>
-                </div>
+                <>
+                  <div className="flex items-center gap-2">
+                    <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
+                    <span className="text-gray-500">Scanning (continuous)</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <ScanFace className="w-3.5 h-3.5 text-gray-500" />
+                    <span className="text-gray-500">
+                      {detectedList.length} detected
+                    </span>
+                  </div>
+                </>
               )}
             </div>
           </div>
@@ -382,7 +475,11 @@ export default function LiveMonitor() {
               detectedList.map((d) => (
                 <div
                   key={d.studentId}
-                  className="bg-gray-800/50 rounded-xl p-4 border border-gray-700/40 hover:border-gray-600/60 transition-colors"
+                  className={`bg-gray-800/50 rounded-xl p-4 border transition-colors ${
+                    d.livenessConfirmed
+                      ? "border-emerald-500/40 hover:border-emerald-400/60"
+                      : "border-yellow-500/30 hover:border-yellow-400/50"
+                  }`}
                 >
                   <div className="flex items-center justify-between mb-1.5">
                     <h3 className="font-semibold text-white text-sm truncate">
@@ -397,10 +494,59 @@ export default function LiveMonitor() {
                     {d.rollNumber}
                   </p>
                   <p className="text-xs text-gray-500">{d.department}</p>
-                  <div className="flex items-center gap-1.5 mt-2 text-[11px] text-gray-500">
-                    <Clock className="w-3 h-3" />
-                    In class: {formatElapsed(d.entryTime)}
+
+                  {/* Liveness Status */}
+                  <div className={`mt-2 rounded-lg px-2.5 py-1.5 text-[11px] font-medium flex items-center gap-2 ${
+                    d.livenessConfirmed
+                      ? "bg-emerald-500/10 text-emerald-400"
+                      : "bg-yellow-500/10 text-yellow-400"
+                  }`}>
+                    {d.livenessConfirmed ? (
+                      <>
+                        <ShieldCheck className="w-3.5 h-3.5" />
+                        Live — Attendance Recorded
+                      </>
+                    ) : (
+                      <>
+                        <ShieldAlert className="w-3.5 h-3.5" />
+                        Verifying liveness...
+                      </>
+                    )}
                   </div>
+
+                  {/* Liveness details */}
+                  {d.liveness && (
+                    <div className="mt-2 grid grid-cols-3 gap-1.5 text-[10px]">
+                      <div className={`flex items-center gap-1 ${d.liveness.checks.blinkDetected ? 'text-emerald-600' : 'text-gray-400'}`}>
+                        <Eye className="w-3 h-3" />
+                        Blink {d.liveness.checks.blinkDetected ? "✓" : "—"}
+                      </div>
+                      <div className={`flex items-center gap-1 ${d.liveness.checks.movementDetected ? 'text-emerald-600' : 'text-gray-400'}`}>
+                        <Move className="w-3 h-3" />
+                        Move {d.liveness.checks.movementDetected ? "✓" : "—"}
+                      </div>
+                      <div className={`flex items-center gap-1 ${d.liveness.checks.screenGlareOk ? 'text-emerald-600' : 'text-red-500'}`}>
+                        <ScanFace className="w-3 h-3" />
+                        {d.liveness.checks.screenGlareOk ? "Real" : "Screen!"}
+                      </div>
+                      <div className={`flex items-center gap-1 ${d.liveness.checks.textureOk ? 'text-emerald-600' : 'text-gray-400'}`}>
+                        Texture {d.liveness.checks.textureOk ? "✓" : "—"}
+                      </div>
+                      <div className={`flex items-center gap-1 ${d.liveness.checks.sizeOk ? 'text-emerald-600' : 'text-red-500'}`}>
+                        Size {d.liveness.checks.sizeOk ? "✓" : "⚠"}
+                      </div>
+                      <div className="flex items-center gap-1 text-gray-500 font-medium">
+                        {Math.round(d.liveness.score * 100)}%
+                      </div>
+                    </div>
+                  )}
+
+                  {d.livenessConfirmed && (
+                    <div className="flex items-center gap-1.5 mt-2 text-[11px] text-gray-500">
+                      <Clock className="w-3 h-3" />
+                      In class: {formatElapsed(d.entryTime)}
+                    </div>
+                  )}
                 </div>
               ))
             )}

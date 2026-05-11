@@ -6,9 +6,17 @@ import Student from "../models/Student.js";
 // @access  Public
 export const recordEntry = async (req, res) => {
   try {
-    const { studentId } = req.body;
+    const { studentId, livenessScore } = req.body;
     const now = new Date();
     const today = now.toISOString().split("T")[0];
+
+    // Reject if liveness score is provided but too low (anti-spoofing)
+    if (livenessScore !== undefined && livenessScore < 0.4) {
+      return res.status(403).json({
+        success: false,
+        message: "Liveness check failed — possible spoofing attempt",
+      });
+    }
 
     // Check if student exists
     const student = await Student.findById(studentId);

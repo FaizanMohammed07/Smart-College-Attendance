@@ -26,14 +26,47 @@ const studentSchema = new mongoose.Schema(
       required: [true, "Parent phone is required"],
       match: [/^[0-9]{10}$/, "Please enter a valid 10-digit phone number"],
     },
+    // Primary display photo (first captured)
     photoUrl: {
       type: String,
       default: null,
     },
+    // All captured variation photos – up to 8
+    photoUrls: {
+      type: [String],
+      default: [],
+    },
+    // LEGACY single descriptor (kept for backward compat, auto-migrated)
     faceDescriptor: {
       type: [Number],
       default: null,
     },
+    // Multi-angle face descriptors – one per captured photo
+    faceDescriptors: {
+      type: [[Number]],
+      default: [],
+    },
+    // Labels for each captured photo
+    photoLabels: {
+      type: [String],
+      default: [],
+    },
+    classroom: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Classroom",
+      default: null,
+    },
+    parentUser: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    subjects: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Subject",
+      },
+    ],
     isActive: {
       type: Boolean,
       default: true,

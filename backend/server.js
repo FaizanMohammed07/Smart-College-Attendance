@@ -10,6 +10,12 @@ import { connectDB } from "./config/database.js";
 import studentRoutes from "./routes/studentRoutes.js";
 import attendanceRoutes from "./routes/attendanceRoutes.js";
 import analyticsRoutes from "./routes/analyticsRoutes.js";
+import authRoutes from "./routes/authRoutes.js";
+import adminRoutes from "./routes/adminRoutes.js";
+import facultyRoutes from "./routes/facultyRoutes.js";
+import studentDashRoutes from "./routes/studentDashRoutes.js";
+import parentRoutes from "./routes/parentRoutes.js";
+import notificationRoutes from "./routes/notificationRoutes.js";
 import { errorHandler } from "./middleware/errorHandler.js";
 import { initializeSocketHandlers } from "./sockets/attendanceSocket.js";
 
@@ -65,6 +71,12 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "OK", message: "Server is running" });
 });
 
+app.use("/api/auth", authRoutes);
+app.use("/api/admin", adminRoutes);
+app.use("/api/faculty", facultyRoutes);
+app.use("/api/student-dash", studentDashRoutes);
+app.use("/api/parent", parentRoutes);
+app.use("/api/notifications", notificationRoutes);
 app.use("/api/students", studentRoutes);
 app.use("/api/attendance", attendanceRoutes);
 app.use("/api/analytics", analyticsRoutes);
